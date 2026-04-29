@@ -1,6 +1,6 @@
 """
 Meeting Log Bot
-- 5분마다 노션 _meeting-log 폴더를 체크
+- 5분마다 노션 Meetinglog 데이터베이스를 체크
 - 새 회의록 발견 시 Claude API로 요약
 - Slack #meetinglog 채널에 자동 포스팅
 """
@@ -9,20 +9,20 @@ import os
 import json
 import time
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import requests
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 # ── 환경변수 ──────────────────────────────────────────────
 NOTION_API_KEY = os.environ["NOTION_API_KEY"]
-NOTION_PARENT_PAGE_ID = os.environ.get(
-    "NOTION_PARENT_PAGE_ID", "32f7f6a88125802f87d4deb93baaf32a"
-)  # _meeting-log 페이지 ID
+NOTION_DATABASE_ID = os.environ.get(
+    "NOTION_DATABASE_ID", "3327f6a8812580b8bc7ec27ed8ea280a"
+)  # Meetinglog 데이터베이스 ID
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "C0B0CC7R9R8")  # #meetinglog
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL_MINUTES", "5"))
-POSTED_IDS_FILE = "/tmp/posted_ids.json"  # Railway는 재배포 시 리셋됨 (아래 Notion 방식으로 보완)
+POSTED_IDS_FILE = "/tmp/posted_ids.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,7 +32,6 @@ log = logging.getLogger(__name__)
 
 # ── 유틸: 이미 포스팅한 ID 관리 ───────────────────────────
 def load_posted_ids() -> set:
-    """로컬 파일에서 이미 처리한 페이지 ID 목록 로드"""
     try:
         with open(POSTED_IDS_FILE, "r") as f:
             return set(json.load(f))
@@ -45,7 +44,7 @@ def save_posted_ids(ids: set):
         json.dump(list(ids), f)
 
 
-# ── 1단계: 노션에서 _meeting-log 하위 페이지 조회 ──────────
+# ── 1단계: 노션 데이터베이스에서 최근 회의록 조회 ──────────
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_API_KEY}",
     "Notion-Version": "2022-06-28",
@@ -53,24 +52,44 @@ NOTION_HEADERS = {
 }
 
 
-def get_child_pages() -> list[dict]:
-    """_meeting-log 페이지의 하위 블록(child_page) 목록 조회"""
-    url = f"https://api.notion.com/v1/blocks/{NOTION_PARENT_PAGE_ID}/children?page_size=20"
-    resp = requests.get(url, headers=NOTION_HEADERS)
+def get_recent_meetings() -> list[dict]:
+    """Meetinglog 데이터베이스에서 최근 24시간 내 생성된 페이지 조회"""
+    now = datetime.now(timezone.utc)
+    since = (now - timedelta(hours=24)).isoformat()
+
+    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
+    resp = requests.post(
+        url,
+        headers=NOTION_HEADERS,
+        json={
+            "filter": {
+                "timestamp": "created_time",
+                "created_time": {"on_or_after": since},
+            },
+            "sorts": [{"timestamp": "created_time", "direction": "descending"}],
+            "page_size": 10,
+        },
+    )
     resp.raise_for_status()
     results = resp.json().get("results", [])
 
     pages = []
-    for block in results:
-        if block.get("type") == "child_page":
-            pages.append(
-                {
-                    "id": block["id"],
-                    "title": block["child_page"]["title"],
-                    "created_time": block.get("created_time", ""),
-                    "last_edited_time": block.get("last_edited_time", ""),
-                }
-            )
+    for page in results:
+        # 제목 추출
+        title = ""
+        title_prop = page.get("properties", {}).get("Name", {})
+        if title_prop.get("type") == "title":
+            title_parts = title_prop.get("title", [])
+            title = "".join(t.get("plain_text", "") for t in title_parts)
+
+        pages.append(
+            {
+                "id": page["id"],
+                "title": title or "제목 없음",
+                "created_time": page.get("created_time", ""),
+                "url": page.get("url", ""),
+            }
+        )
     return pages
 
 
@@ -97,7 +116,6 @@ def _blocks_to_text(blocks: list, depth: int = 0) -> str:
         btype = b.get("type", "")
         prefix = "  " * depth
 
-        # 텍스트 기반 블록 처리
         if btype in (
             "paragraph",
             "heading_1",
@@ -128,10 +146,12 @@ def _blocks_to_text(blocks: list, depth: int = 0) -> str:
                 if text.strip():
                     lines.append(f"{prefix}{text}")
 
-        # 자식 블록 재귀
         if b.get("has_children"):
-            children = _fetch_blocks(b["id"])
-            lines.append(_blocks_to_text(children, depth + 1))
+            try:
+                children = _fetch_blocks(b["id"])
+                lines.append(_blocks_to_text(children, depth + 1))
+            except Exception as e:
+                log.warning(f"자식 블록 읽기 실패: {e}")
 
     return "\n".join(lines)
 
@@ -168,6 +188,7 @@ _담당자명:_
 - 전체 길이는 Slack 메시지로 읽기 좋은 수준으로 (너무 길지 않게)
 - 액션 아이템이 가장 중요 - 빠뜨리지 말 것
 - 불필요한 잡담은 제외하고 비즈니스 관련 내용만 추출
+- 회의록 내용이 너무 짧거나 비어있으면 "회의록 내용이 아직 작성되지 않았습니다." 라고만 작성
 """
 
 
@@ -225,28 +246,18 @@ def post_to_slack(message: str, notion_url: str):
 # ── 메인 폴링 로직 ───────────────────────────────────────
 def check_and_post():
     """새 회의록 체크 → 요약 → Slack 전송"""
-    log.info("🔍 노션 _meeting-log 폴더 체크 중...")
+    log.info("🔍 노션 Meetinglog 데이터베이스 체크 중...")
 
     try:
         posted_ids = load_posted_ids()
-        pages = get_child_pages()
+        pages = get_recent_meetings()
 
-        # 최근 24시간 내 생성된 페이지만 대상
-        now = datetime.now(timezone.utc)
         new_pages = []
         for p in pages:
-            if p["id"].replace("-", "") in posted_ids or p["id"] in posted_ids:
+            pid_clean = p["id"].replace("-", "")
+            if p["id"] in posted_ids or pid_clean in posted_ids:
                 continue
-            # created_time 파싱
-            try:
-                created = datetime.fromisoformat(
-                    p["created_time"].replace("Z", "+00:00")
-                )
-                hours_ago = (now - created).total_seconds() / 3600
-                if hours_ago <= 24:
-                    new_pages.append(p)
-            except (ValueError, KeyError):
-                continue
+            new_pages.append(p)
 
         if not new_pages:
             log.info("📭 새 회의록 없음")
@@ -259,6 +270,9 @@ def check_and_post():
             content = get_page_content(page["id"])
             if len(content.strip()) < 50:
                 log.info(f"⏭️ 내용이 너무 짧아 스킵: {page['title']}")
+                posted_ids.add(page["id"])
+                posted_ids.add(page["id"].replace("-", ""))
+                save_posted_ids(posted_ids)
                 continue
 
             # Claude로 요약
@@ -266,13 +280,12 @@ def check_and_post():
             summary = summarize_with_claude(page["title"], content)
 
             # Slack에 전송
-            page_id_clean = page["id"].replace("-", "")
-            notion_url = f"https://www.notion.so/{page_id_clean}"
+            notion_url = page.get("url", f"https://www.notion.so/{page['id'].replace('-', '')}")
             post_to_slack(summary, notion_url)
 
             # 처리 완료 기록
             posted_ids.add(page["id"])
-            posted_ids.add(page_id_clean)
+            posted_ids.add(page["id"].replace("-", ""))
             save_posted_ids(posted_ids)
             log.info(f"✅ 완료: {page['title']}")
 
@@ -286,7 +299,7 @@ def check_and_post():
 # ── 스케줄러 실행 ─────────────────────────────────────────
 if __name__ == "__main__":
     log.info(f"🚀 Meeting Log Bot 시작 (폴링 간격: {POLL_INTERVAL_MINUTES}분)")
-    log.info(f"📂 노션 폴더: {NOTION_PARENT_PAGE_ID}")
+    log.info(f"📂 노션 DB: {NOTION_DATABASE_ID}")
     log.info(f"💬 Slack 채널: {SLACK_CHANNEL_ID}")
 
     # 시작 시 한 번 즉시 실행

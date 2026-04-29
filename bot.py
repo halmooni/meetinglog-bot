@@ -24,7 +24,7 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "C0B0CC7R9R8")
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL_MINUTES", "5"))
-REMINDER_HOURS = int(os.environ.get("REMINDER_HOURS", "48"))  # 리마인더 간격 (시간)
+REMINDER_HOURS = int(os.environ.get("REMINDER_HOURS", "24"))  # 리마인더 간격 (시간)
 POSTED_IDS_FILE = "/tmp/posted_ids.json"
 ACTION_ITEMS_FILE = "/tmp/action_items.json"
 

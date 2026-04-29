@@ -57,6 +57,22 @@ def name_to_slack_mention(name: str) -> str:
     return name
 
 
+def convert_to_slack_markdown(text: str) -> str:
+    """일반 마크다운을 Slack 마크다운으로 변환"""
+    # **bold** → *bold* (이중 별표를 단일로)
+    text = re.sub(r'\*\*(.+?)\*\*', r'*\1*', text)
+    # ### 헤더 → 볼드로 대체
+    text = re.sub(r'^###\s+(.+)$', r'*\1*', text, flags=re.MULTILINE)
+    text = re.sub(r'^##\s+(.+)$', r'*\1*', text, flags=re.MULTILINE)
+    text = re.sub(r'^#\s+(.+)$', r'*\1*', text, flags=re.MULTILINE)
+    # --- 구분선 → 유니코드 라인
+    text = re.sub(r'^-{3,}$', '━━━━━━━━━━━━━━━', text, flags=re.MULTILINE)
+    # - [ ] 체크박스 → bullet
+    text = re.sub(r'^(\s*)- \[ \]\s*', r'\1• ', text, flags=re.MULTILINE)
+    text = re.sub(r'^(\s*)- \[x\]\s*', r'\1✅ ', text, flags=re.MULTILINE)
+    return text
+
+
 def replace_names_with_mentions(text: str) -> str:
     """텍스트 내 모든 팀 멤버 이름을 Slack 멘션으로 변환"""
     for member_name, info in TEAM_MEMBERS.items():
@@ -206,39 +222,50 @@ SUMMARY_SYSTEM_PROMPT = """당신은 회의록 요약 전문가입니다.
 - 김민수 (사업/전략/BM 담당)
 - 민혁 (개발/프로덕트 담당)
 
+## 중요: Slack 마크다운 문법
+이 요약은 Slack 메시지로 사용됩니다. 반드시 Slack 마크다운 문법을 사용하세요:
+- 볼드: *볼드* (별표 1개). **이중별표 금지**
+- 이탤릭: _이탤릭_
+- 취소선: ~취소선~
+- 코드: `코드`
+- 구분선: ── 또는 ━━━ (유니코드 라인 문자 사용. --- 금지)
+- 제목/헤더: 지원 안 됨. 이모지 + 볼드로 대체
+
 ## 요약 포맷
-회의록 내용을 아래 포맷으로 요약하세요. Slack 메시지로 사용됩니다.
 
-📋 **{회의 제목}** ({날짜})
+📋 *{회의 제목}* ({날짜})
 
----
+━━━━━━━━━━━━━━━
 
-**🎯 핵심 결론**
+🎯 *핵심 결론*
 • (3~5개 핵심 결론)
 
----
+━━━━━━━━━━━━━━━
 
-**📌 액션 아이템**
+📌 *액션 아이템*
 담당자별로 그룹핑. 담당자는 반드시 "김민수" 또는 "민혁" 중 하나(또는 공동)로 명확히 지정.
 
 _김민수:_
-- [ ] 할일 내용
+• 할일 내용
 
 _민혁:_
-- [ ] 할일 내용
+• 할일 내용
 
 _공동:_
-- [ ] 할일 내용
+• 할일 내용
 
----
+━━━━━━━━━━━━━━━
 
-**💡 주요 논의 사항**
-(주요 토픽별로 2~3줄씩 간결하게 요약)
+💡 *주요 논의 사항*
+(주요 토픽별로 2~3줄씩 간결하게 요약. 소제목은 *볼드*로 표시)
 
----
+━━━━━━━━━━━━━━━
 
 ## 중요 규칙
 - 한국어로 작성
+- **이중 별표(asterisk) 절대 사용 금지**. 볼드는 반드시 *단일 별표*만 사용
+- 구분선은 ━━━ (유니코드) 사용. --- 사용 금지
+- 체크박스 [ ] 대신 • (bullet) 사용
 - 액션 아이템이 가장 중요 - 빠뜨리지 말 것
 - 담당자 배정 기준:
   - "제가 해볼게요", "제가 리서치할게요" 등은 발화자에게 할당
@@ -277,13 +304,33 @@ def summarize_with_claude(title: str, content: str) -> str:
 
 
 # ── 3단계: Slack에 메시지 전송 (멘션 포함) ────────────────
+def _split_message(text: str, max_len: int = 2900) -> list[str]:
+    """Slack block 한 개당 3000자 제한이 있으므로 메시지를 분할"""
+    if len(text) <= max_len:
+        return [text]
+    
+    chunks = []
+    while text:
+        if len(text) <= max_len:
+            chunks.append(text)
+            break
+        # 줄바꿈 기준으로 분할
+        split_at = text.rfind("\n", 0, max_len)
+        if split_at == -1:
+            split_at = max_len
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip("\n")
+    return chunks
+
+
 def post_to_slack(message: str, notion_url: str) -> dict:
     """Slack에 메시지 전송. 멘션이 포함된 메시지 전송 후 메시지 정보 반환."""
-    # 이름을 Slack 멘션으로 변환
+    # 이름을 Slack 멘션으로 변환 + Slack 마크다운 변환
     message_with_mentions = replace_names_with_mentions(message)
+    message_formatted = convert_to_slack_markdown(message_with_mentions)
 
     full_message = (
-        f"{message_with_mentions}\n\n"
+        f"{message_formatted}\n\n"
         f"🔗 <{notion_url}|노션 회의록 원문>\n\n"
         f"_🤖 meetinglog bot에 의해 자동 생성됨_"
     )
@@ -296,7 +343,17 @@ def post_to_slack(message: str, notion_url: str) -> dict:
         },
         json={
             "channel": SLACK_CHANNEL_ID,
-            "text": full_message,
+            "text": full_message,  # fallback for notifications
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": chunk,
+                    },
+                }
+                for chunk in _split_message(full_message)
+            ],
             "unfurl_links": False,
         },
     )
@@ -335,6 +392,12 @@ def post_confirmation_request(parent_ts: str, action_items_text: str):
         json={
             "channel": SLACK_CHANNEL_ID,
             "text": confirmation_msg,
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": confirmation_msg},
+                }
+            ],
             "thread_ts": parent_ts,
             "unfurl_links": False,
         },
@@ -415,6 +478,13 @@ def send_reminder(channel_id: str, thread_ts: str, meeting_title: str, action_it
         json={
             "channel": channel_id,
             "text": reminder_msg,
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": chunk},
+                }
+                for chunk in _split_message(reminder_msg)
+            ],
             "thread_ts": thread_ts,
             "unfurl_links": False,
         },
